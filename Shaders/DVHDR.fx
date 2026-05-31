@@ -19,6 +19,10 @@
 	#define DVHDR_ANALYZE_STRIDE 2   // sample every Nth pixel for the histogram (perf vs accuracy)
 #endif
 
+#ifndef DVHDR_LC_MAX_RADIUS
+	#define DVHDR_LC_MAX_RADIUS 24   // upper bound on the local-contrast blur radius (perf ceiling)
+#endif
+
 #define DVHDR_BINS        256
 #define DVHDR_GROUP       16
 #define DVHDR_STEP        (DVHDR_ANALYZE_STRIDE * DVHDR_GROUP)
@@ -140,6 +144,30 @@ uniform float DynamicContrast <
 	ui_category = "Tone curve";
 > = 0.1;
 
+uniform float LocalContrast <
+	ui_type = "slider";
+	ui_label = "Local contrast";
+	ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+	ui_tooltip = "Restores local detail flattened by the shadow lift. Pushes each lifted pixel away from its neighbourhood mean in PQ space, scaled by the lift amount and confined to the lifted region. 0 = off.";
+	ui_category = "Tone curve";
+> = 0.35;
+
+uniform float LocalContrastRadius <
+	ui_type = "slider";
+	ui_label = "Local contrast radius";
+	ui_min = 1.0; ui_max = 24.0; ui_step = 1.0;
+	ui_tooltip = "Neighbourhood size (pixels) for the local mean. Small = fine acutance, large = macro 'clarity'. Higher radii cost more.";
+	ui_category = "Tone curve";
+> = 12.0;
+
+uniform float LocalContrastBias <
+	ui_type = "slider";
+	ui_label = "Local contrast bias";
+	ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+	ui_tooltip = "1.0 = only lighten pixels brighter than their neighbours (gentle, halo-resistant). 0.0 = symmetric, also deepening pixels below their neighbours for stronger separation.";
+	ui_category = "Tone curve";
+> = 1.0;
+
 uniform bool UseHighlightRolloff <
 	ui_label = "BT.2390 highlight rolloff";
 	ui_tooltip = "Smoothly compress highlights above the display peak instead of clipping them.";
@@ -183,6 +211,12 @@ sampler2D<int> sampHistogram { Texture = texHistogram; };
 texture texAdapt { Width = 1; Height = 1; Format = RGBA32F; };
 storage2D<float4> stAdapt { Texture = texAdapt; };
 sampler samplerAdapt { Texture = texAdapt; };
+
+// Separable luminance blur (PQ-encoded) — neighbourhood mean for local contrast.
+texture texLumaH     { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F; };
+sampler sampLumaH    { Texture = texLumaH; };
+texture texLumaBlur  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F; };
+sampler sampLumaBlur { Texture = texLumaBlur; };
 
 // ---------------------------------------------------------------------------
 //  Colour-space helpers
@@ -358,6 +392,57 @@ void CS_Adapt(uint3 id : SV_DispatchThreadID)
 }
 
 // ---------------------------------------------------------------------------
+//  Pass 3b — separable luminance blur (neighbourhood mean for local contrast)
+// ---------------------------------------------------------------------------
+
+float pq_luma_at(int2 px, int csp)
+{
+	float3 c = tex2Dfetch(samplerBackBuffer, px).rgb;
+	return nits_to_pq(luminance(decode_to_nits(c, csp), csp));
+}
+
+float PS_BlurH(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+	int  csp = get_csp();
+	int2 px  = int2(pos.xy);
+	if (LocalContrast <= 0.0)
+		return pq_luma_at(px, csp); // feature off — pass per-pixel luma through untouched
+
+	int   R     = clamp(int(LocalContrastRadius + 0.5), 1, DVHDR_LC_MAX_RADIUS);
+	float sigma = max(R * 0.5, 1.0);
+	float sum = 0.0, wsum = 0.0;
+	[loop]
+	for (int d = -R; d <= R; d++)
+	{
+		int2  sp  = int2(clamp(px.x + d, 0, BUFFER_WIDTH - 1), px.y);
+		float wgt = exp(-0.5 * float(d * d) / (sigma * sigma));
+		sum  += pq_luma_at(sp, csp) * wgt;
+		wsum += wgt;
+	}
+	return sum / max(wsum, 1e-5);
+}
+
+float PS_BlurV(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+	int2 px = int2(pos.xy);
+	if (LocalContrast <= 0.0)
+		return tex2Dfetch(sampLumaH, px).r;
+
+	int   R     = clamp(int(LocalContrastRadius + 0.5), 1, DVHDR_LC_MAX_RADIUS);
+	float sigma = max(R * 0.5, 1.0);
+	float sum = 0.0, wsum = 0.0;
+	[loop]
+	for (int d = -R; d <= R; d++)
+	{
+		int2  sp  = int2(px.x, clamp(px.y + d, 0, BUFFER_HEIGHT - 1));
+		float wgt = exp(-0.5 * float(d * d) / (sigma * sigma));
+		sum  += tex2Dfetch(sampLumaH, sp).r * wgt;
+		wsum += wgt;
+	}
+	return sum / max(wsum, 1e-5);
+}
+
+// ---------------------------------------------------------------------------
 //  Pass 4 — apply dynamic tonemap
 // ---------------------------------------------------------------------------
 
@@ -401,7 +486,21 @@ float4 PS_Tonemap(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 		Yc = pq_to_nits(saturate(pivot + (p - pivot) * (1.0 + strength)));
 	}
 
-	float Yt = UseHighlightRolloff ? bt2390_eetf(Yc, adPeak * min(g, 1.0), DisplayPeak, DisplayBlack) : Yc;
+	// Local contrast: the global lift raises each pixel toward its neighbours, collapsing
+	// Weber contrast (ΔL/L). Push the lifted pixel back away from its neighbourhood mean in
+	// PQ space, scaled by the lift amount and confined to the lifted region by the same
+	// weight, so highlights and UI stay halo-free. Bias chooses one-sided vs symmetric.
+	float Ylc = Yc;
+	if (LocalContrast > 0.0 && g > 1.0)
+	{
+		float pqBlur = tex2D(sampLumaBlur, uv).r;
+		float detail = nits_to_pq(Ysrc) - pqBlur;
+		float biased = (detail > 0.0) ? detail : detail * (1.0 - LocalContrastBias);
+		float amount = LocalContrast * saturate((g - 1.0) / max(MaxGain - 1.0, 0.01)) * w;
+		Ylc = pq_to_nits(saturate(nits_to_pq(Yc) + biased * amount));
+	}
+
+	float Yt = UseHighlightRolloff ? bt2390_eetf(Ylc, adPeak * min(g, 1.0), DisplayPeak, DisplayBlack) : Ylc;
 
 	float3 outNits = lin * (Yt / max(Ysrc, 1e-4));
 	float3 outc    = lerp(src, encode_from_nits(outNits, csp), Strength);
@@ -445,5 +544,7 @@ technique DVHDR <
 	pass Clear   { ComputeShader = CS_Clear<DVHDR_BINS, 1>;        DispatchSizeX = 1;                DispatchSizeY = 1; }
 	pass Analyze { ComputeShader = CS_Analyze<DVHDR_GROUP, DVHDR_GROUP>; DispatchSizeX = DVHDR_DISPATCH_X; DispatchSizeY = DVHDR_DISPATCH_Y; }
 	pass Adapt   { ComputeShader = CS_Adapt<1, 1>;                 DispatchSizeX = 1;                DispatchSizeY = 1; }
+	pass BlurH   { VertexShader = VS_Post; PixelShader = PS_BlurH; RenderTarget = texLumaH; }
+	pass BlurV   { VertexShader = VS_Post; PixelShader = PS_BlurV; RenderTarget = texLumaBlur; }
 	pass Apply   { VertexShader = VS_Post; PixelShader = PS_Tonemap; }
 }
