@@ -108,9 +108,9 @@ uniform float HighlightProtect <
 	ui_type = "slider";
 	ui_label = "Protect highlights above (nits)";
 	ui_min = 1.0; ui_max = 80.0; ui_step = 1.0;
-	ui_tooltip = "The dark-scene lift fades to none above this luminance, so anything at or above it keeps its native brightness instead of being pushed higher. Compression is unaffected.";
+	ui_tooltip = "The dark-scene lift fades to none above this luminance, so anything at or above it keeps its native brightness instead of being pushed higher. Protection ramps in across 50%-100% of this value: full lift below half, smoothly fading to passthrough at the threshold. Compression is unaffected.";
 	ui_category = "Governor";
-> = 10.0;
+> = 1.0;
 
 uniform float PeakPercentile <
 	ui_type = "slider";
@@ -181,6 +181,30 @@ uniform float Strength <
 	ui_tooltip = "Blend between the original RenoDX image and the dynamically tonemapped result.";
 	ui_category = "Tone curve";
 > = 1.0;
+
+uniform float DitherThresholdNits <
+	ui_type = "slider";
+	ui_label = "Dither threshold (nits)";
+	ui_min = 100.0; ui_max = 4000.0; ui_step = 10.0;
+	ui_tooltip = "Luminance above which blue-noise dither begins to engage. Aimed at masking panel posterisation in hot highlights. Below this value no dither is applied. Tune to where your panel begins to band.";
+	ui_category = "Dither";
+> = 700.0;
+
+uniform float DitherStrengthNits <
+	ui_type = "slider";
+	ui_label = "Dither strength (nits)";
+	ui_min = 0.0; ui_max = 40.0; ui_step = 0.5;
+	ui_tooltip = "Peak amplitude of the dither in nits at full strength. 0 = off. Larger = noisier, smoother gradients. Typical: 4-20.";
+	ui_category = "Dither";
+> = 8.0;
+
+uniform float DitherGradBoost <
+	ui_type = "slider";
+	ui_label = "Dither edge boost";
+	ui_min = 0.0; ui_max = 8.0; ui_step = 0.1;
+	ui_tooltip = "How much the dither amplitude is boosted at high-frequency luma transitions (edges) where banding is most visible. 0 = uniform dither.";
+	ui_category = "Dither";
+> = 2.0;
 
 uniform int DebugOverlay <
 	ui_type = "combo";
@@ -314,6 +338,14 @@ float bt2390_eetf(float L, float srcPeak, float dstPeak, float dstBlack)
 float bin_to_nits(int i)
 {
 	return pq_to_nits((i + 0.5) / float(DVHDR_BINS));
+}
+
+// Interleaved Gradient Noise — Jorge Jimenez. Cheap blue-noise-like pattern
+// from screen-space pixel coordinates, no texture required. Output is in
+// [0, 1] with good spectral properties for dither.
+float ign(float2 pos)
+{
+	return frac(52.9829189 * frac(dot(pos, float2(0.06711056, 0.00583715))));
 }
 
 // ---------------------------------------------------------------------------
@@ -468,11 +500,38 @@ float4 PS_Tonemap(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	float3 lin  = decode_to_nits(src, csp);
 	float  Ysrc = luminance(lin, csp);
 
-	// Highlight-protection weight: 1 in shadow, fading to 0 at/above the knee so the
-	// UI and sunlit highlights keep their native brightness.
-	float w     = 1.0 - smoothstep(HighlightProtect * 0.3, HighlightProtect, Ysrc);
-	float gEff  = (g > 1.0) ? lerp(1.0, g, w) : g;
-	float Ylift = Ysrc * gEff;
+	// Highlight protection — full multiplicative lift below 50% of
+	// HighlightProtect, smoothstep blend on the gain across [50%, 100%], then
+	// identity above. Gives a flat "fully-lifted dark zone" the user can size
+	// with HighlightProtect, while the upper half of that band smoothly
+	// releases the lift so the seam at the protection boundary is invisible.
+	//
+	// Monotonic for MaxGain <= 2.0 (the default of 1.5 has comfortable
+	// margin). Above g = 2 the blend lets Y*gEff overshoot HighlightProtect
+	// and the boundary re-introduces a non-monotonic seam — keep MaxGain
+	// below 2 to stay on the safe side.
+	float Ylift, w;
+	if (g > 1.0)
+	{
+		if (Ysrc >= HighlightProtect)
+		{
+			Ylift = Ysrc;
+			w     = 0.0;
+		}
+		else
+		{
+			float t    = smoothstep(0.5, 1.0, Ysrc / max(HighlightProtect, 1e-4));
+			float gEff = lerp(g, 1.0, t);
+			Ylift      = Ysrc * gEff;
+			w          = 1.0 - t;
+		}
+	}
+	else
+	{
+		// Global compression — applied uniformly, protect band irrelevant.
+		Ylift = Ysrc * g;
+		w     = 1.0;
+	}
 
 	// Dynamic contrast: lifting shadows flattens them, so expand tonal separation
 	// about the lifted scene average. Strength tracks the lift amount and is confined
@@ -501,6 +560,31 @@ float4 PS_Tonemap(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	}
 
 	float Yt = UseHighlightRolloff ? bt2390_eetf(Ylc, adPeak * min(g, 1.0), DisplayPeak, DisplayBlack) : Ylc;
+
+	// Hot-highlight dither — break up the panel's posterisation in the
+	// brightest regions. Amplitude scales with how far Yt sits above
+	// DitherThresholdNits (linear ramp to full at DisplayPeak), and is
+	// additionally boosted in pixels with large 4-neighbour luma deltas
+	// where the banding is most visible. Pattern is IGN (near-blue spectrum,
+	// no texture required).
+	if (DitherStrengthNits > 0.0 && Yt > DitherThresholdNits)
+	{
+		float bright = saturate((Yt - DitherThresholdNits)
+		                      / max(DisplayPeak - DitherThresholdNits, 1.0));
+
+		float2 ts = float2(1.0 / float(BUFFER_WIDTH), 1.0 / float(BUFFER_HEIGHT));
+		float YL = luminance(decode_to_nits(tex2D(samplerBackBuffer, uv + float2(-ts.x, 0.0)).rgb, csp), csp);
+		float YR = luminance(decode_to_nits(tex2D(samplerBackBuffer, uv + float2( ts.x, 0.0)).rgb, csp), csp);
+		float YU = luminance(decode_to_nits(tex2D(samplerBackBuffer, uv + float2(0.0, -ts.y)).rgb, csp), csp);
+		float YD = luminance(decode_to_nits(tex2D(samplerBackBuffer, uv + float2(0.0,  ts.y)).rgb, csp), csp);
+		float gradient = max(max(abs(Ysrc - YL), abs(Ysrc - YR)),
+		                     max(abs(Ysrc - YU), abs(Ysrc - YD)));
+		float gradFactor = saturate(gradient * 0.005); // full at ~200 nit delta
+
+		float noise = ign(pos.xy) - 0.5;             // [-0.5, +0.5]
+		float amp   = DitherStrengthNits * bright * (1.0 + DitherGradBoost * gradFactor);
+		Yt = max(Yt + noise * amp, 0.0);
+	}
 
 	float3 outNits = lin * (Yt / max(Ysrc, 1e-4));
 	float3 outc    = lerp(src, encode_from_nits(outNits, csp), Strength);
