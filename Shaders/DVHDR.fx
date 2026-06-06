@@ -72,6 +72,14 @@ uniform float DisplayBlack <
 	ui_category = "Display";
 > = 0.0;
 
+uniform float BlackLift <
+	ui_type = "slider";
+	ui_label = "Black-level lift (nits)";
+	ui_min = 0.0; ui_max = 5.0; ui_step = 0.00001;
+	ui_tooltip = "Raises the entire frame's luminance off zero by this fixed amount. Every pixel's luminance increases by exactly this many nits, so pure black becomes a faint neutral grey. For panels that crush detail right at the bottom of their range / cannot cleanly drive near-zero. 0 = disabled.";
+	ui_category = "Display";
+> = 0.00248;
+
 uniform float HeadroomPercent <
 	ui_type = "slider";
 	ui_label = "FALL headroom (%)";
@@ -142,7 +150,7 @@ uniform float DynamicContrast <
 	ui_min = 0.0; ui_max = 1.5; ui_step = 0.01;
 	ui_tooltip = "Restores contrast lost when shadows are lifted. Expands tonal separation about the lifted scene average, scaled by how hard the scene is being lifted and confined to the shadow region, so mean brightness and highlights/UI stay put. 0 = off.";
 	ui_category = "Tone curve";
-> = 0.1;
+> = 0.2;
 
 uniform float LocalContrast <
 	ui_type = "slider";
@@ -587,6 +595,15 @@ float4 PS_Tonemap(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	}
 
 	float3 outNits = lin * (Yt / max(Ysrc, 1e-4));
+
+	// Black-level lift — raise the entire frame's luminance off zero by a fixed
+	// number of nits. A neutral additive (luminance weights sum to 1, so every
+	// pixel's luminance rises by exactly BlackLift) for panels that crush detail
+	// right at the bottom of their range. Additive in nits, so pure-black pixels
+	// become a faint neutral grey rather than producing a divide-by-zero.
+	if (BlackLift > 0.0)
+		outNits += BlackLift;
+
 	float3 outc    = lerp(src, encode_from_nits(outNits, csp), Strength);
 
 #if DVHDR_ENABLE_OVERLAY
