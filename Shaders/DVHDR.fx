@@ -116,9 +116,17 @@ uniform float HighlightProtect <
 	ui_type = "slider";
 	ui_label = "Protect highlights above (nits)";
 	ui_min = 1.0; ui_max = 80.0; ui_step = 1.0;
-	ui_tooltip = "The dark-scene lift fades to none above this luminance, so anything at or above it keeps its native brightness instead of being pushed higher. Protection ramps in across 50%-100% of this value: full lift below half, smoothly fading to passthrough at the threshold. Compression is unaffected.";
+	ui_tooltip = "The dark-scene lift fades to none above this luminance, so anything at or above it keeps its native brightness instead of being pushed higher. The rolloff is smooth in PQ across the whole range below it. Compression is unaffected.";
 	ui_category = "Governor";
-> = 1.0;
+> = 80.0;
+
+uniform float ShadowToe <
+	ui_type = "slider";
+	ui_label = "Shadow toe (nits)";
+	ui_min = 0.0; ui_max = 5.0; ui_step = 0.01;
+	ui_tooltip = "Below this luminance the lift eases back to identity slope, so the deepest blacks keep the source's own gradation instead of being amplified by the gain into a contouring 'cliff' just above black. 0 = off.";
+	ui_category = "Governor";
+> = 0.25;
 
 uniform float PeakPercentile <
 	ui_type = "slider";
@@ -190,29 +198,29 @@ uniform float Strength <
 	ui_category = "Tone curve";
 > = 1.0;
 
-uniform float DitherThresholdNits <
+uniform float DitherStrength <
 	ui_type = "slider";
-	ui_label = "Dither threshold (nits)";
-	ui_min = 100.0; ui_max = 4000.0; ui_step = 10.0;
-	ui_tooltip = "Luminance above which blue-noise dither begins to engage. Aimed at masking panel posterisation in hot highlights. Below this value no dither is applied. Tune to where your panel begins to band.";
+	ui_label = "Dither strength (code steps)";
+	ui_min = 0.0; ui_max = 4.0; ui_step = 0.1;
+	ui_tooltip = "Blue-noise output dither amplitude in 10-bit code steps. Breaks panel quantisation banding at all levels, in luma and chroma. 0 = off. ~1-2 typical; raise for 8-bit panels, lower for 12-bit.";
 	ui_category = "Dither";
-> = 700.0;
+> = 1.5;
 
-uniform float DitherStrengthNits <
+uniform float DitherActivity <
 	ui_type = "slider";
-	ui_label = "Dither strength (nits)";
-	ui_min = 0.0; ui_max = 40.0; ui_step = 0.5;
-	ui_tooltip = "Peak amplitude of the dither in nits at full strength. 0 = off. Larger = noisier, smoother gradients. Typical: 4-20.";
+	ui_label = "Dither activity";
+	ui_min = 0.0005; ui_max = 0.02; ui_step = 0.0005;
+	ui_tooltip = "Local PQ variance at which the dither reaches full strength. Smaller = more sensitive (engages on fainter gradients); larger = only stronger gradients are dithered.";
 	ui_category = "Dither";
-> = 8.0;
+> = 0.002;
 
-uniform float DitherGradBoost <
+uniform float DitherFloor <
 	ui_type = "slider";
-	ui_label = "Dither edge boost";
-	ui_min = 0.0; ui_max = 8.0; ui_step = 0.1;
-	ui_tooltip = "How much the dither amplitude is boosted at high-frequency luma transitions (edges) where banding is most visible. 0 = uniform dither.";
+	ui_label = "Dither floor";
+	ui_min = 0.0; ui_max = 1.0; ui_step = 0.05;
+	ui_tooltip = "Baseline dither fraction kept even on near-flat areas. Raise toward 1 for full-frame dithering if wide flat bands persist; lower for cleaner flat fields.";
 	ui_category = "Dither";
-> = 2.0;
+> = 0.4;
 
 uniform int DebugOverlay <
 	ui_type = "combo";
@@ -508,91 +516,63 @@ float4 PS_Tonemap(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	float3 lin  = decode_to_nits(src, csp);
 	float  Ysrc = luminance(lin, csp);
 
-	// Highlight protection — full multiplicative lift below 50% of
-	// HighlightProtect, smoothstep blend on the gain across [50%, 100%], then
-	// identity above. Gives a flat "fully-lifted dark zone" the user can size
-	// with HighlightProtect, while the upper half of that band smoothly
-	// releases the lift so the seam at the protection boundary is invisible.
-	//
-	// Monotonic for MaxGain <= 2.0 (the default of 1.5 has comfortable
-	// margin). Above g = 2 the blend lets Y*gEff overshoot HighlightProtect
-	// and the boundary re-introduces a non-monotonic seam — keep MaxGain
-	// below 2 to stay on the safe side.
-	float Ylift, w;
-	if (g > 1.0)
-	{
-		if (Ysrc >= HighlightProtect)
-		{
-			Ylift = Ysrc;
-			w     = 0.0;
-		}
-		else
-		{
-			float t    = smoothstep(0.5, 1.0, Ysrc / max(HighlightProtect, 1e-4));
-			float gEff = lerp(g, 1.0, t);
-			Ylift      = Ysrc * gEff;
-			w          = 1.0 - t;
-		}
-	}
-	else
-	{
-		// Global compression — applied uniformly, protect band irrelevant.
-		Ylift = Ysrc * g;
-		w     = 1.0;
-	}
+	// Shadow lift + contrast, all performed in PQ so they reshape one consistent
+	// perceptual curve (we return to linear light only once, at the recombine).
+	// The lift eases from full (deep shadow) to none (toward HighlightProtect)
+	// across a wide PQ band via wShadow, so a shadowed face that straddles the
+	// threshold lifts evenly instead of banding at a hard ridge — the previous
+	// rolloff blended over [0.5*HP, HP] in linear nits, a perceptual sliver,
+	// which posterised shadow gradients. wShadow also gates the contrast stages.
+	float pqSrc = nits_to_pq(Ysrc);
 
-	// Dynamic contrast: lifting shadows flattens them, so expand tonal separation
-	// about the lifted scene average. Strength tracks the lift amount and is confined
-	// to the shadow region by the same weight, preserving mean luma and highlights.
-	float Yc = Ylift;
+	// Upper rolloff (highlight protection): the lift fades to none toward
+	// HighlightProtect. Lower rolloff (shadow toe): the lift fades back to
+	// identity slope toward black, so the deepest blacks keep the source's own
+	// gradation instead of being amplified by the gain into a contouring cliff
+	// just above black. Both ease smoothly in PQ; their product gates the lift
+	// and the contrast stages so the whole bottom of the curve stays coherent.
+	float wShadow = (g > 1.0)
+		? 1.0 - smoothstep(0.0, nits_to_pq(max(HighlightProtect, 1e-4)), pqSrc)
+		: 1.0;
+	float wToe = (ShadowToe > 0.0) ? smoothstep(0.0, nits_to_pq(ShadowToe), pqSrc) : 1.0;
+	float w    = wShadow * wToe;
+
+	// Lift by interpolating in PQ between the source and the fully-lifted value,
+	// so the lift rides the gamma curve rather than scaling linear light.
+	float pqLift = (g > 1.0) ? lerp(pqSrc, nits_to_pq(Ysrc * g), w)
+	                         : nits_to_pq(Ysrc * g);
+
+	// Dynamic contrast — a smooth bipolar S-curve about the lifted scene average
+	// in PQ. The expansion is strongest for tones near the average (restoring
+	// midtone depth) and eases off for tones far from it, so deep shadows are
+	// not crushed nor highlights blown. Gives depth without the harsh linear
+	// crush of the old symmetric form or the flatness of a one-sided one.
+	float pqC = pqLift;
 	if (DynamicContrast > 0.0 && g > 1.0)
 	{
 		float strength = DynamicContrast * saturate((g - 1.0) / max(MaxGain - 1.0, 0.01)) * w;
 		float pivot    = nits_to_pq(max(adFall * g, 0.1));
-		float p        = nits_to_pq(Ylift);
-		Yc = pq_to_nits(saturate(pivot + (p - pivot) * (1.0 + strength)));
+		float d        = pqLift - pivot;
+		pqC = saturate(pivot + d * (1.0 + strength * exp(-d * d * 12.0)));
 	}
 
-	// Local contrast: the global lift raises each pixel toward its neighbours, collapsing
-	// Weber contrast (ΔL/L). Push the lifted pixel back away from its neighbourhood mean in
-	// PQ space, scaled by the lift amount and confined to the lifted region by the same
-	// weight, so highlights and UI stay halo-free. Bias chooses one-sided vs symmetric.
-	float Ylc = Yc;
+	// Local contrast — restore local detail flattened by the lift, pushing each
+	// pixel away from its neighbourhood mean in PQ. Bias (default 1.0) keeps it
+	// one-sided (only lighten above-mean pixels), adding acutance without
+	// deepening shadows or haloing.
+	float pqLc = pqC;
 	if (LocalContrast > 0.0 && g > 1.0)
 	{
 		float pqBlur = tex2D(sampLumaBlur, uv).r;
-		float detail = nits_to_pq(Ysrc) - pqBlur;
+		float detail = pqSrc - pqBlur;
 		float biased = (detail > 0.0) ? detail : detail * (1.0 - LocalContrastBias);
 		float amount = LocalContrast * saturate((g - 1.0) / max(MaxGain - 1.0, 0.01)) * w;
-		Ylc = pq_to_nits(saturate(nits_to_pq(Yc) + biased * amount));
+		pqLc = saturate(pqC + biased * amount);
 	}
+
+	float Ylc = pq_to_nits(pqLc);
 
 	float Yt = UseHighlightRolloff ? bt2390_eetf(Ylc, adPeak * min(g, 1.0), DisplayPeak, DisplayBlack) : Ylc;
-
-	// Hot-highlight dither — break up the panel's posterisation in the
-	// brightest regions. Amplitude scales with how far Yt sits above
-	// DitherThresholdNits (linear ramp to full at DisplayPeak), and is
-	// additionally boosted in pixels with large 4-neighbour luma deltas
-	// where the banding is most visible. Pattern is IGN (near-blue spectrum,
-	// no texture required).
-	if (DitherStrengthNits > 0.0 && Yt > DitherThresholdNits)
-	{
-		float bright = saturate((Yt - DitherThresholdNits)
-		                      / max(DisplayPeak - DitherThresholdNits, 1.0));
-
-		float2 ts = float2(1.0 / float(BUFFER_WIDTH), 1.0 / float(BUFFER_HEIGHT));
-		float YL = luminance(decode_to_nits(tex2D(samplerBackBuffer, uv + float2(-ts.x, 0.0)).rgb, csp), csp);
-		float YR = luminance(decode_to_nits(tex2D(samplerBackBuffer, uv + float2( ts.x, 0.0)).rgb, csp), csp);
-		float YU = luminance(decode_to_nits(tex2D(samplerBackBuffer, uv + float2(0.0, -ts.y)).rgb, csp), csp);
-		float YD = luminance(decode_to_nits(tex2D(samplerBackBuffer, uv + float2(0.0,  ts.y)).rgb, csp), csp);
-		float gradient = max(max(abs(Ysrc - YL), abs(Ysrc - YR)),
-		                     max(abs(Ysrc - YU), abs(Ysrc - YD)));
-		float gradFactor = saturate(gradient * 0.005); // full at ~200 nit delta
-
-		float noise = ign(pos.xy) - 0.5;             // [-0.5, +0.5]
-		float amp   = DitherStrengthNits * bright * (1.0 + DitherGradBoost * gradFactor);
-		Yt = max(Yt + noise * amp, 0.0);
-	}
 
 	float3 outNits = lin * (Yt / max(Ysrc, 1e-4));
 	float3 outc    = lerp(src, encode_from_nits(outNits, csp), Strength);
@@ -609,6 +589,45 @@ float4 PS_Tonemap(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	{
 		float3 fn = decode_to_nits(outc, csp);
 		outc = encode_from_nits(BlackLift + fn * (1.0 - BlackLift / max(DisplayPeak, 1.0)), csp);
+	}
+
+	// Output dither — break the panel's quantisation banding at all levels, in
+	// luma AND chroma. Per-channel blue noise sized to one perceptual (PQ) code
+	// step, so the amplitude tracks the quantiser at every level rather than only
+	// in highlights. Gated by local neighbourhood activity in ANY channel, so
+	// flat fields stay clean while every region containing gradation is broken
+	// up. DitherStrength = 10-bit code steps; DitherActivity = PQ variance for
+	// full strength; DitherFloor = baseline kept on near-flat areas.
+	if (DitherStrength > 0.0)
+	{
+		float2 ts = float2(1.0 / float(BUFFER_WIDTH), 1.0 / float(BUFFER_HEIGHT));
+		float3 pC = linear_to_PQ(saturate(decode_to_nits(src, csp) / 10000.0));
+		float3 pL = linear_to_PQ(saturate(decode_to_nits(tex2D(samplerBackBuffer, uv + float2(-ts.x, 0.0)).rgb, csp) / 10000.0));
+		float3 pR = linear_to_PQ(saturate(decode_to_nits(tex2D(samplerBackBuffer, uv + float2( ts.x, 0.0)).rgb, csp) / 10000.0));
+		float3 pU = linear_to_PQ(saturate(decode_to_nits(tex2D(samplerBackBuffer, uv + float2(0.0, -ts.y)).rgb, csp) / 10000.0));
+		float3 pD = linear_to_PQ(saturate(decode_to_nits(tex2D(samplerBackBuffer, uv + float2(0.0,  ts.y)).rgb, csp) / 10000.0));
+		float3 dev = max(max(abs(pL - pC), abs(pR - pC)), max(abs(pU - pC), abs(pD - pC)));
+		float  act  = max(dev.r, max(dev.g, dev.b));         // luma OR chroma variance, in PQ
+		float  actF = lerp(DitherFloor, 1.0, saturate(act / max(DitherActivity, 1e-5)));
+		float  lsb  = (DitherStrength / 1023.0) * actF;      // one PQ code step, scaled
+
+		float3 noise = float3(ign(pos.xy),
+		                      ign(pos.xy + float2(53.0, 17.0)),
+		                      ign(pos.xy + float2(101.0, 71.0))) - 0.5;
+
+		if (csp == CSP_HDR10)
+		{
+			outc = saturate(outc + noise * lsb);             // output is PQ — perturb directly
+		}
+		else
+		{
+			// scRGB: convert one PQ step to a linear-light delta at this level, so
+			// the perturbation is perceptually ~1 step without clipping the gamut.
+			float3 vN = max(decode_to_nits(outc, csp), 0.0);
+			float3 pq = linear_to_PQ(saturate(vN / 10000.0));
+			float3 dN = PQ_to_linear(saturate(pq + lsb)) * 10000.0 - vN;
+			outc += noise * (dN / 80.0);
+		}
 	}
 
 #if DVHDR_ENABLE_OVERLAY
