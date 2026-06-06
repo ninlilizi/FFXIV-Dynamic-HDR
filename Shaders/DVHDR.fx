@@ -76,7 +76,7 @@ uniform float BlackLift <
 	ui_type = "slider";
 	ui_label = "Black-level lift (nits)";
 	ui_min = 0.0; ui_max = 5.0; ui_step = 0.00001;
-	ui_tooltip = "Raises the entire frame's luminance off zero by this fixed amount. Every pixel's luminance increases by exactly this many nits, so pure black becomes a faint neutral grey. For panels that crush detail right at the bottom of their range / cannot cleanly drive near-zero. 0 = disabled.";
+	ui_tooltip = "Raises the black floor to this many nits while pulling the ceiling (MaxCLL) back down by the same amount, so the result stays exactly within [BlackLift, Display peak] and nothing clips. Pure black becomes a faint neutral grey. For panels that crush detail right at the bottom of their range / cannot cleanly drive near-zero. 0 = disabled.";
 	ui_category = "Display";
 > = 0.00248;
 
@@ -596,13 +596,15 @@ float4 PS_Tonemap(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 
 	float3 outNits = lin * (Yt / max(Ysrc, 1e-4));
 
-	// Black-level lift — raise the entire frame's luminance off zero by a fixed
-	// number of nits. A neutral additive (luminance weights sum to 1, so every
-	// pixel's luminance rises by exactly BlackLift) for panels that crush detail
-	// right at the bottom of their range. Additive in nits, so pure-black pixels
-	// become a faint neutral grey rather than producing a divide-by-zero.
+	// Black-level lift — raise the floor to BlackLift nits while pulling the
+	// ceiling (MaxCLL) back down by the same amount: an affine remap of
+	// [0, DisplayPeak] -> [BlackLift, DisplayPeak]. Each channel's peak stays
+	// pinned at DisplayPeak so nothing is pushed out of range, the darkest
+	// pixels rise to a faint neutral grey, and being affine (not a ratio) it is
+	// safe on pure-black pixels. For panels that crush detail right at the
+	// bottom of their range.
 	if (BlackLift > 0.0)
-		outNits += BlackLift;
+		outNits = BlackLift + outNits * (1.0 - BlackLift / max(DisplayPeak, 1.0));
 
 	float3 outc    = lerp(src, encode_from_nits(outNits, csp), Strength);
 
