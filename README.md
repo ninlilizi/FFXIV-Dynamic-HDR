@@ -1,6 +1,6 @@
 # DVHDR — Dynamic Tonemapping for ReShade
 
-A ReShade 6.5+ effect that adds **dynamic, per-scene display-mapping on top of an existing HDR image**. It was built for Final Fantasy XIV running under [RenoDX](https://github.com/clshortfuse/renodx), but works after any HDR tonemapper that outputs scRGB FP16 or HDR10 PQ.
+A ReShade 6.5+ effect that adds **dynamic, per-scene display-mapping on top of an existing HDR image**. It was built for Final Fantasy XIV running under [RenoDX](https://github.com/clshortfuse/renodx), but works after any HDR tonemapper that outputs scRGB FP16 or HDR10 PQ. But will work in reShade for any games that output in HDR.
 
 ## What it is
 
