@@ -156,33 +156,41 @@ uniform float DynamicContrast <
 	ui_type = "slider";
 	ui_label = "Dynamic contrast";
 	ui_min = 0.0; ui_max = 1.5; ui_step = 0.01;
-	ui_tooltip = "Restores contrast lost when shadows are lifted. Expands tonal separation about the lifted scene average, scaled by how hard the scene is being lifted and confined to the shadow region, so mean brightness and highlights/UI stay put. 0 = off.";
+	ui_tooltip = "Macro contrast — a smooth S-curve applied to the low-pass base about the lifted scene average, shaping large-scale tonal separation without touching the per-pixel detail. Scaled by the lift amount and confined to the shadow region. 0 = off.";
 	ui_category = "Tone curve";
 > = 0.2;
 
-uniform float LocalContrast <
+uniform float DetailGain <
 	ui_type = "slider";
-	ui_label = "Local contrast";
-	ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
-	ui_tooltip = "Restores local detail flattened by the shadow lift. Pushes each lifted pixel away from its neighbourhood mean in PQ space, scaled by the lift amount and confined to the lifted region. 0 = off.";
+	ui_label = "Detail gain (contrast preserve)";
+	ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
+	ui_tooltip = "The per-pixel perceptual contrast (everything finer than the detail radius) is re-added onto the lifted base at this gain. 1.0 = preserve exactly, so lightened pixels keep their contrast instead of flattening; >1 = enhance/sharpen; 0 = off (flat lift). This is the contrast-preserving local tonemap.";
 	ui_category = "Tone curve";
-> = 0.35;
+> = 1.0;
 
-uniform float LocalContrastRadius <
+uniform float DetailRadius <
 	ui_type = "slider";
-	ui_label = "Local contrast radius";
+	ui_label = "Detail radius";
 	ui_min = 1.0; ui_max = 24.0; ui_step = 1.0;
-	ui_tooltip = "Neighbourhood size (pixels) for the local mean. Small = fine acutance, large = macro 'clarity'. Higher radii cost more.";
+	ui_tooltip = "Base/detail split radius (pixels) — the low-pass separating 'base' tone from 'detail'. Larger = smoother base, more detail preserved, but softer halos at strong edges; smaller = finer, less halo. Higher radii cost more.";
 	ui_category = "Tone curve";
 > = 12.0;
 
-uniform float LocalContrastBias <
+uniform float DetailBias <
 	ui_type = "slider";
-	ui_label = "Local contrast bias";
+	ui_label = "Detail bias (halo guard)";
 	ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
-	ui_tooltip = "1.0 = only lighten pixels brighter than their neighbours (gentle, halo-resistant). 0.0 = symmetric, also deepening pixels below their neighbours for stronger separation.";
+	ui_tooltip = "Damps below-base (darker-than-neighbourhood) detail to resist haloing at strong edges. 0.0 = symmetric (true contrast preservation); 1.0 = only re-add brighter-than-base detail.";
 	ui_category = "Tone curve";
-> = 1.0;
+> = 0.0;
+
+uniform float LiftLocality <
+	ui_type = "slider";
+	ui_label = "Lift locality";
+	ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+	ui_tooltip = "Where the dark-scene lift takes its reference. 0 = region: lifts dark areas but leaves a dark pixel amid brighter content alone (preserves local contrast). 1 = per-pixel: every dark tone lifts (more visible on mixed content, flattens local contrast). 0.5 = balance.";
+	ui_category = "Tone curve";
+> = 0.0;
 
 uniform bool UseHighlightRolloff <
 	ui_label = "BT.2390 highlight rolloff";
@@ -196,6 +204,14 @@ uniform float Strength <
 	ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
 	ui_tooltip = "Blend between the original RenoDX image and the dynamically tonemapped result.";
 	ui_category = "Tone curve";
+> = 1.0;
+
+uniform float ChromaCorrect <
+	ui_type = "slider";
+	ui_label = "Chroma correction (DICE)";
+	ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+	ui_tooltip = "ICtCp recombine: as luminance is lifted or compressed, chroma is scaled to hold perceived saturation through the curve, so colours stay vivid and hue-true instead of washing toward white. 1.0 = full preservation, 0.0 = intensity only.";
+	ui_category = "Color";
 > = 1.0;
 
 uniform float DitherStrength <
@@ -365,6 +381,60 @@ float ign(float2 pos)
 }
 
 // ---------------------------------------------------------------------------
+//  ICtCp (BT.2100) — DICE-style recombine. The operator's intensity change
+//  (Ysrc -> Yt) is applied as a PQ-domain shift on the true ICtCp intensity,
+//  then chroma is scaled to hold perceived saturation through the curve. ICtCp
+//  is defined on BT.2020 primaries, so scRGB (709) is converted in and back out.
+// ---------------------------------------------------------------------------
+
+static const float3x3 RGB709_to_2020 = float3x3(
+	0.627404, 0.329283, 0.043313,
+	0.069097, 0.919540, 0.011362,
+	0.016391, 0.088013, 0.895596);
+static const float3x3 RGB2020_to_709 = float3x3(
+	 1.660491, -0.587641, -0.072850,
+	-0.124550,  1.132900, -0.008349,
+	-0.018151, -0.100579,  1.118730);
+static const float3x3 RGB2020_to_LMS = float3x3(
+	1688.0/4096.0,  2146.0/4096.0,   262.0/4096.0,
+	 683.0/4096.0,  2951.0/4096.0,   462.0/4096.0,
+	  99.0/4096.0,   309.0/4096.0,  3688.0/4096.0);
+static const float3x3 LMS_to_RGB2020 = float3x3(
+	 3.4366066943, -2.5064521187,  0.0698454243,
+	-0.7913295556,  1.9836004518, -0.1922708962,
+	-0.0259498997, -0.0989137147,  1.1248636144);
+static const float3x3 LMSp_to_ICtCp = float3x3(
+	0.5,             0.5,             0.0,
+	6610.0/4096.0, -13613.0/4096.0,  7003.0/4096.0,
+	17933.0/4096.0, -17390.0/4096.0,  -543.0/4096.0);
+static const float3x3 ICtCp_to_LMSp = float3x3(
+	1.0,  0.0086090370,  0.1110296250,
+	1.0, -0.0086090370, -0.1110296250,
+	1.0,  0.5600313357, -0.3206271479);
+
+float3 dice_recombine(float3 linNits, float Ysrc, float Yt, int csp, float chromaCorrect)
+{
+	float3 rgb2020 = (csp == CSP_HDR10) ? linNits : mul(RGB709_to_2020, linNits);
+	float3 lms     = mul(RGB2020_to_LMS, max(rgb2020, 0.0));
+	float3 lmsp    = linear_to_PQ(lms / 10000.0);
+	float3 ictcp   = mul(LMSp_to_ICtCp, lmsp);
+
+	float Isrc      = ictcp.x;
+	float pqDelta   = nits_to_pq(Yt) - nits_to_pq(max(Ysrc, 1e-4));
+	float Idst      = saturate(Isrc + pqDelta);
+	float chromaScl = lerp(1.0, Idst / max(Isrc, 1e-4), chromaCorrect);
+
+	ictcp.x   = Idst;
+	ictcp.yz *= chromaScl;
+
+	float3 lmsp2   = mul(ICtCp_to_LMSp, ictcp);
+	float3 lms2    = PQ_to_linear(saturate(lmsp2)) * 10000.0;
+	float3 out2020 = mul(LMS_to_RGB2020, lms2);
+	float3 outNits = (csp == CSP_HDR10) ? out2020 : mul(RGB2020_to_709, out2020);
+	return max(outNits, 0.0);
+}
+
+// ---------------------------------------------------------------------------
 //  Pass 1 — clear histogram
 // ---------------------------------------------------------------------------
 
@@ -453,10 +523,10 @@ float PS_BlurH(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
 	int  csp = get_csp();
 	int2 px  = int2(pos.xy);
-	if (LocalContrast <= 0.0)
+	if (DetailGain <= 0.0)
 		return pq_luma_at(px, csp); // feature off — pass per-pixel luma through untouched
 
-	int   R     = clamp(int(LocalContrastRadius + 0.5), 1, DVHDR_LC_MAX_RADIUS);
+	int   R     = clamp(int(DetailRadius + 0.5), 1, DVHDR_LC_MAX_RADIUS);
 	float sigma = max(R * 0.5, 1.0);
 	float sum = 0.0, wsum = 0.0;
 	[loop]
@@ -473,10 +543,10 @@ float PS_BlurH(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 float PS_BlurV(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
 	int2 px = int2(pos.xy);
-	if (LocalContrast <= 0.0)
+	if (DetailGain <= 0.0)
 		return tex2Dfetch(sampLumaH, px).r;
 
-	int   R     = clamp(int(LocalContrastRadius + 0.5), 1, DVHDR_LC_MAX_RADIUS);
+	int   R     = clamp(int(DetailRadius + 0.5), 1, DVHDR_LC_MAX_RADIUS);
 	float sigma = max(R * 0.5, 1.0);
 	float sum = 0.0, wsum = 0.0;
 	[loop]
@@ -516,14 +586,17 @@ float4 PS_Tonemap(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	float3 lin  = decode_to_nits(src, csp);
 	float  Ysrc = luminance(lin, csp);
 
-	// Shadow lift + contrast, all performed in PQ so they reshape one consistent
-	// perceptual curve (we return to linear light only once, at the recombine).
-	// The lift eases from full (deep shadow) to none (toward HighlightProtect)
-	// across a wide PQ band via wShadow, so a shadowed face that straddles the
-	// threshold lifts evenly instead of banding at a hard ridge — the previous
-	// rolloff blended over [0.5*HP, HP] in linear nits, a perceptual sliver,
-	// which posterised shadow gradients. wShadow also gates the contrast stages.
-	float pqSrc = nits_to_pq(Ysrc);
+	// Contrast-preserving lift via base/detail separation. The governor lift and
+	// the macro S-curve act on a low-pass BASE only; the per-pixel detail is
+	// re-added at full amplitude afterward, so the local slope of the tone curve
+	// for detail finer than the base radius is forced back to 1 — lightened
+	// pixels keep their contrast instead of being flattened by the curve. All in
+	// PQ; we return to linear light once, at the recombine.
+	float pqSrc    = nits_to_pq(Ysrc);
+	float pqBase   = tex2D(sampLumaBlur, uv).r;        // low-pass luma (PQ); == pqSrc when DetailGain <= 0
+	float pqRef    = lerp(pqBase, pqSrc, saturate(LiftLocality)); // 0 = region, 1 = per-pixel
+	float detail   = pqSrc - pqRef;                   // per-pixel perceptual contrast
+	float refNits  = pq_to_nits(pqRef);
 
 	// Upper rolloff (highlight protection): the lift fades to none toward
 	// HighlightProtect. Lower rolloff (shadow toe): the lift fades back to
@@ -532,49 +605,38 @@ float4 PS_Tonemap(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	// just above black. Both ease smoothly in PQ; their product gates the lift
 	// and the contrast stages so the whole bottom of the curve stays coherent.
 	float wShadow = (g > 1.0)
-		? 1.0 - smoothstep(0.0, nits_to_pq(max(HighlightProtect, 1e-4)), pqSrc)
+		? 1.0 - smoothstep(0.0, nits_to_pq(max(HighlightProtect, 1e-4)), pqRef)
 		: 1.0;
-	float wToe = (ShadowToe > 0.0) ? smoothstep(0.0, nits_to_pq(ShadowToe), pqSrc) : 1.0;
+	float wToe = (ShadowToe > 0.0) ? smoothstep(0.0, nits_to_pq(ShadowToe), pqRef) : 1.0;
 	float w    = wShadow * wToe;
 
-	// Lift by interpolating in PQ between the source and the fully-lifted value,
-	// so the lift rides the gamma curve rather than scaling linear light.
-	float pqLift = (g > 1.0) ? lerp(pqSrc, nits_to_pq(Ysrc * g), w)
-	                         : nits_to_pq(Ysrc * g);
+	float pqRefL = (g > 1.0) ? lerp(pqRef, nits_to_pq(refNits * g), w)
+	                         : nits_to_pq(refNits * g);
 
-	// Dynamic contrast — a smooth bipolar S-curve about the lifted scene average
-	// in PQ. The expansion is strongest for tones near the average (restoring
-	// midtone depth) and eases off for tones far from it, so deep shadows are
-	// not crushed nor highlights blown. Gives depth without the harsh linear
-	// crush of the old symmetric form or the flatness of a one-sided one.
-	float pqC = pqLift;
+	// Macro contrast — a smooth bipolar S-curve about the lifted scene average,
+	// applied to the BASE only so it shapes large-scale tonal separation without
+	// touching the detail we are about to restore.
 	if (DynamicContrast > 0.0 && g > 1.0)
 	{
 		float strength = DynamicContrast * saturate((g - 1.0) / max(MaxGain - 1.0, 0.01)) * w;
 		float pivot    = nits_to_pq(max(adFall * g, 0.1));
-		float d        = pqLift - pivot;
-		pqC = saturate(pivot + d * (1.0 + strength * exp(-d * d * 12.0)));
+		float d        = pqRefL - pivot;
+		pqRefL = saturate(pivot + d * (1.0 + strength * exp(-d * d * 12.0)));
 	}
 
-	// Local contrast — restore local detail flattened by the lift, pushing each
-	// pixel away from its neighbourhood mean in PQ. Bias (default 1.0) keeps it
-	// one-sided (only lighten above-mean pixels), adding acutance without
-	// deepening shadows or haloing.
-	float pqLc = pqC;
-	if (LocalContrast > 0.0 && g > 1.0)
-	{
-		float pqBlur = tex2D(sampLumaBlur, uv).r;
-		float detail = pqSrc - pqBlur;
-		float biased = (detail > 0.0) ? detail : detail * (1.0 - LocalContrastBias);
-		float amount = LocalContrast * saturate((g - 1.0) / max(MaxGain - 1.0, 0.01)) * w;
-		pqLc = saturate(pqC + biased * amount);
-	}
+	// Re-inject the per-pixel detail at full amplitude: the local slope for
+	// anything finer than the base radius returns to 1, so lightened pixels keep
+	// their perceptual contrast instead of being flattened by the lift. DetailGain
+	// = 1 preserves; > 1 enhances; 0 = flat lift. DetailBias damps below-base
+	// detail for halo resistance (0 = symmetric, full preserve).
+	float biased = (detail > 0.0) ? detail : detail * (1.0 - DetailBias);
+	float pqOut  = saturate(pqRefL + biased * DetailGain);
 
-	float Ylc = pq_to_nits(pqLc);
+	float Ylc = pq_to_nits(pqOut);
 
 	float Yt = UseHighlightRolloff ? bt2390_eetf(Ylc, adPeak * min(g, 1.0), DisplayPeak, DisplayBlack) : Ylc;
 
-	float3 outNits = lin * (Yt / max(Ysrc, 1e-4));
+	float3 outNits = dice_recombine(lin, Ysrc, Yt, csp, ChromaCorrect);
 	float3 outc    = lerp(src, encode_from_nits(outNits, csp), Strength);
 
 	// Black-level lift — applied as an absolute floor on the FINAL output, after
