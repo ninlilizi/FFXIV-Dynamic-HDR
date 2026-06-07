@@ -238,6 +238,22 @@ uniform float DitherFloor <
 	ui_category = "Dither";
 > = 0.4;
 
+uniform float DebandThreshold <
+	ui_type = "slider";
+	ui_label = "Deband threshold (code steps)";
+	ui_min = 0.0; ui_max = 8.0; ui_step = 0.1;
+	ui_tooltip = "Analytic debanding sensitivity, in 10-bit PQ code steps. 0 = off. A region that is flat but stepped (neighbours within this many code steps) is reconstructed smooth; detail and edges beyond it are kept. ~1.5-3 typical; higher catches coarser bands but can soften faint detail.";
+	ui_category = "Deband";
+> = 0.0;
+
+uniform float DebandRange <
+	ui_type = "slider";
+	ui_label = "Deband range (pixels)";
+	ui_min = 1.0; ui_max = 48.0; ui_step = 1.0;
+	ui_tooltip = "Deband sample radius in pixels. Larger flattens broader bands but costs a little more and can soften if pushed too far.";
+	ui_category = "Deband";
+> = 16.0;
+
 uniform int DebugOverlay <
 	ui_type = "combo";
 	ui_label = "Debug overlay";
@@ -435,6 +451,44 @@ float3 dice_recombine(float3 linNits, float Ysrc, float Yt, int csp, float chrom
 }
 
 // ---------------------------------------------------------------------------
+//  Source debanding — reconstruct quantised gradients before the lift can
+//  amplify them. Per channel in PQ: gather neighbours at two IGN-rotated radii;
+//  a flat-but-stepped neighbourhood (max deviation below DebandThreshold code
+//  steps) is averaged smooth; genuine detail / edges are kept. Threshold IS the
+//  detector.
+// ---------------------------------------------------------------------------
+
+float3 src_to_pq(float3 c, int csp) { return linear_to_PQ(saturate(decode_to_nits(c, csp) / 10000.0)); }
+float3 pq_to_src(float3 p, int csp) { return encode_from_nits(PQ_to_linear(saturate(p)) * 10000.0, csp); }
+
+float3 deband_source(float2 uv, float2 pos, float2 ts, int csp)
+{
+	float3 c   = src_to_pq(tex2D(samplerBackBuffer, uv).rgb, csp);
+	float  thr = DebandThreshold / 1023.0;
+	float3 sum = c;
+	float3 mx  = float3(0.0, 0.0, 0.0);
+
+	[unroll]
+	for (int i = 1; i <= 2; i++)
+	{
+		float  ang = ign(pos + float2(i * 41.0, i * 23.0)) * 6.2831853;
+		float  r   = DebandRange * (float(i) / 2.0);
+		float2 d   = float2(cos(ang), sin(ang)) * r * ts;
+		float2 q   = float2(-d.y, d.x);
+		float3 s0 = src_to_pq(tex2D(samplerBackBuffer, uv + d).rgb, csp);
+		float3 s1 = src_to_pq(tex2D(samplerBackBuffer, uv - d).rgb, csp);
+		float3 s2 = src_to_pq(tex2D(samplerBackBuffer, uv + q).rgb, csp);
+		float3 s3 = src_to_pq(tex2D(samplerBackBuffer, uv - q).rgb, csp);
+		sum += s0 + s1 + s2 + s3;
+		mx   = max(mx, max(max(abs(s0 - c), abs(s1 - c)), max(abs(s2 - c), abs(s3 - c))));
+	}
+
+	float3 avg = sum / 9.0;
+	float3 t   = saturate(mx / max(thr, 1e-6));
+	return pq_to_src(lerp(avg, c, t), csp);
+}
+
+// ---------------------------------------------------------------------------
 //  Pass 1 — clear histogram
 // ---------------------------------------------------------------------------
 
@@ -573,7 +627,9 @@ void VS_Post(in uint id : SV_VertexID, out float4 pos : SV_Position, out float2 
 float4 PS_Tonemap(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
 	int csp     = get_csp();
-	float3 src  = tex2D(samplerBackBuffer, uv).rgb;
+	float3 src  = (DebandThreshold > 0.0)
+		? deband_source(uv, pos.xy, float2(1.0 / BUFFER_WIDTH, 1.0 / BUFFER_HEIGHT), csp)
+		: tex2D(samplerBackBuffer, uv).rgb;
 	float4 ad   = tex2Dfetch(samplerAdapt, int2(0, 0));
 	float adPeak = ad.x;
 	float adFall = ad.y;
