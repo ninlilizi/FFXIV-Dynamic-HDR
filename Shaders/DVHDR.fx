@@ -244,7 +244,7 @@ uniform float DebandThreshold <
 	ui_min = 0.0; ui_max = 8.0; ui_step = 0.1;
 	ui_tooltip = "Analytic debanding sensitivity, in 10-bit PQ code steps. 0 = off. A region that is flat but stepped (neighbours within this many code steps) is reconstructed smooth; detail and edges beyond it are kept. ~1.5-3 typical; higher catches coarser bands but can soften faint detail.";
 	ui_category = "Deband";
-> = 0.0;
+> = 3.0;
 
 uniform float DebandRange <
 	ui_type = "slider";
