@@ -23,11 +23,17 @@
 	#define DVHDR_LC_MAX_RADIUS 24   // upper bound on the local-contrast blur radius (perf ceiling)
 #endif
 
+#ifndef DVHDR_BASE_DOWNSCALE
+	#define DVHDR_BASE_DOWNSCALE 2   // the lift base (blurred luma) is computed at 1/N resolution (perf)
+#endif
+
 #define DVHDR_BINS        256
 #define DVHDR_GROUP       16
 #define DVHDR_STEP        (DVHDR_ANALYZE_STRIDE * DVHDR_GROUP)
 #define DVHDR_DISPATCH_X  ((BUFFER_WIDTH  + DVHDR_STEP - 1) / DVHDR_STEP)
 #define DVHDR_DISPATCH_Y  ((BUFFER_HEIGHT + DVHDR_STEP - 1) / DVHDR_STEP)
+#define DVHDR_BASE_W      ((BUFFER_WIDTH  + DVHDR_BASE_DOWNSCALE - 1) / DVHDR_BASE_DOWNSCALE)
+#define DVHDR_BASE_H      ((BUFFER_HEIGHT + DVHDR_BASE_DOWNSCALE - 1) / DVHDR_BASE_DOWNSCALE)
 
 #ifndef BUFFER_COLOR_SPACE
 	#define BUFFER_COLOR_SPACE 0
@@ -47,6 +53,14 @@ uniform int ColorSpaceOverride <
 	ui_tooltip = "Your RenoDX install outputs scRGB FP16. Leave on Auto unless detection misbehaves.";
 	ui_category = "Source";
 > = 0;
+
+uniform float ContentPeak <
+	ui_type = "slider";
+	ui_label = "Content peak seed (nits)";
+	ui_min = 0.0; ui_max = 10000.0; ui_step = 10.0;
+	ui_tooltip = "The content's mastering peak, used to seed the scene peak before the histogram has measured it. 0 = the Display peak (content mastered to the panel, as RenoDX does). Only matters when the content can exceed the display peak, since the rolloff is identity below it.";
+	ui_category = "Source";
+> = 0.0;
 
 uniform float DisplayPeak <
 	ui_type = "slider";
@@ -136,6 +150,30 @@ uniform float PeakPercentile <
 	ui_category = "Governor";
 > = 99.7;
 
+uniform float AblWindow <
+	ui_type = "slider";
+	ui_label = "ABL window (s)";
+	ui_min = 0.0; ui_max = 15.0; ui_step = 0.25;
+	ui_tooltip = "ABL protection follows sustained energy, not a momentary flash. Compression is driven by a slow integrator with this time constant, so brief bright moments play at full brightness. 0 = the fast average drives compression (the previous behaviour).";
+	ui_category = "Governor";
+> = 4.0;
+
+uniform float FastCeiling <
+	ui_type = "slider";
+	ui_label = "Fast ceiling (% of target)";
+	ui_min = 100.0; ui_max = 300.0; ui_step = 5.0;
+	ui_tooltip = "Safety: when the fast frame average exceeds this percentage of the FALL target, compression reacts at attack speed regardless of the slow integrator.";
+	ui_category = "Governor";
+> = 150.0;
+
+uniform int LiftMetric <
+	ui_type = "combo";
+	ui_label = "Lift answers to";
+	ui_items = "Linear frame average (FALL)\0Perceptual (PQ) mean\0";
+	ui_tooltip = "Which average the dark-scene lift responds to. The perceptual mean is closer to how bright a scene reads; the linear average is what the panel's power draw follows and is what compression always uses.";
+	ui_category = "Governor";
+> = 1;
+
 uniform float AttackMs <
 	ui_type = "slider";
 	ui_label = "Attack (ms)";
@@ -151,6 +189,22 @@ uniform float ReleaseMs <
 	ui_tooltip = "Time constant when the scene darkens. Long = settle gently, avoid pumping.";
 	ui_category = "Temporal";
 > = 600.0;
+
+uniform float SceneCut <
+	ui_type = "slider";
+	ui_label = "Scene cut threshold (PQ)";
+	ui_min = 0.0; ui_max = 0.3; ui_step = 0.005;
+	ui_tooltip = "A jump of the frame average larger than this (in PQ, 0-1) is a scene cut: the adaptation snaps to the new scene instead of easing into it. 0 = never snap.";
+	ui_category = "Temporal";
+> = 0.06;
+
+uniform float Deadband <
+	ui_type = "slider";
+	ui_label = "Deadband (%)";
+	ui_min = 0.0; ui_max = 10.0; ui_step = 0.5;
+	ui_tooltip = "Changes of the measured averages smaller than this are ignored, so a scene hovering around its target does not breathe.";
+	ui_category = "Temporal";
+> = 2.0;
 
 uniform float DynamicContrast <
 	ui_type = "slider";
@@ -184,6 +238,14 @@ uniform float DetailBias <
 	ui_category = "Tone curve";
 > = 0.0;
 
+uniform float BaseEdgeSigma <
+	ui_type = "slider";
+	ui_label = "Base edge sigma (PQ)";
+	ui_min = 0.0; ui_max = 0.3; ui_step = 0.005;
+	ui_tooltip = "Edge-aware base: neighbours further than this from the centre (in PQ) weigh little in the blur, so the base follows edges instead of bleeding across them and the lift no longer halos around bright objects. 0 = plain Gaussian.";
+	ui_category = "Tone curve";
+> = 0.08;
+
 uniform float LiftLocality <
 	ui_type = "slider";
 	ui_label = "Lift locality";
@@ -214,13 +276,27 @@ uniform float ChromaCorrect <
 	ui_category = "Color";
 > = 1.0;
 
+uniform float ShadowDesat <
+	ui_type = "slider";
+	ui_label = "Shadow desaturation below (nits)";
+	ui_min = 0.0; ui_max = 10.0; ui_step = 0.05;
+	ui_tooltip = "Below this luminance the chroma preservation fades out, so lifted near-black noise lightens to grey instead of turning into saturated speckle. 0 = off.";
+	ui_category = "Color";
+> = 1.0;
+
+uniform bool GamutClip <
+	ui_label = "Hue-preserving gamut clip";
+	ui_tooltip = "A colour that lands outside the display gamut is pulled toward its own luminance until it fits, instead of having the offending channel chopped (which shifts the hue).";
+	ui_category = "Color";
+> = true;
+
 uniform float DitherStrength <
 	ui_type = "slider";
 	ui_label = "Dither strength (code steps)";
 	ui_min = 0.0; ui_max = 4.0; ui_step = 0.1;
-	ui_tooltip = "Blue-noise output dither amplitude in 10-bit code steps. Breaks panel quantisation banding at all levels, in luma and chroma. 0 = off. ~1-2 typical; raise for 8-bit panels, lower for 12-bit.";
+	ui_tooltip = "Peak-to-peak output dither amplitude in 10-bit code steps. Breaks panel quantisation banding at all levels, in luma and chroma. 0 = off. 2.0 is the textbook value for the triangular shape; raise for 8-bit panels, lower for 12-bit.";
 	ui_category = "Dither";
-> = 1.5;
+> = 2.0;
 
 uniform float DitherActivity <
 	ui_type = "slider";
@@ -237,6 +313,52 @@ uniform float DitherFloor <
 	ui_tooltip = "Baseline dither fraction kept even on near-flat areas. Raise toward 1 for full-frame dithering if wide flat bands persist; lower for cleaner flat fields.";
 	ui_category = "Dither";
 > = 0.4;
+
+uniform bool DitherTemporal <
+	ui_label = "Temporal dither";
+	ui_tooltip = "The dither pattern walks each frame, and alternate frames flip its sign so each pair of frames averages to the unquantised value, instead of the pattern sitting still on the panel.";
+	ui_category = "Dither";
+> = true;
+
+uniform int DitherShape <
+	ui_type = "combo";
+	ui_label = "Dither shape";
+	ui_items = "Uniform\0Triangular\0";
+	ui_tooltip = "Triangular (the sum of two uniforms) decouples the quantisation error from the picture, so no banding-shaped noise modulation survives; the textbook choice. Uniform is the previous behaviour.";
+	ui_category = "Dither";
+> = 1;
+
+uniform float DitherWideSpan <
+	ui_type = "slider";
+	ui_label = "Wide gradation span (pixels)";
+	ui_min = 0.0; ui_max = 48.0; ui_step = 1.0;
+	ui_tooltip = "A slow ramp (a bright sky, a glow) is locally flat, so the neighbour test alone would leave it at the dither floor although it bands the worst. Gradation is therefore also read across this many pixels of the low-pass base.";
+	ui_category = "Dither";
+> = 12.0;
+
+uniform float DitherWideActivity <
+	ui_type = "slider";
+	ui_label = "Wide gradation activity";
+	ui_min = 0.0002; ui_max = 0.01; ui_step = 0.0001;
+	ui_tooltip = "PQ difference across the wide span at which the dither reaches full strength.";
+	ui_category = "Dither";
+> = 0.0015;
+
+uniform float DitherHighlightFrom <
+	ui_type = "slider";
+	ui_label = "Highlight boost from (nits)";
+	ui_min = 0.0; ui_max = 4000.0; ui_step = 10.0;
+	ui_tooltip = "Panels step more coarsely toward their peak. Above this luminance the dither amplitude rises smoothly toward the display peak.";
+	ui_category = "Dither";
+> = 200.0;
+
+uniform float DitherHighlightBoost <
+	ui_type = "slider";
+	ui_label = "Highlight boost";
+	ui_min = 1.0; ui_max = 4.0; ui_step = 0.05;
+	ui_tooltip = "Amplitude multiplier reached at the display peak. 1 = no boost.";
+	ui_category = "Dither";
+> = 2.0;
 
 uniform float DebandThreshold <
 	ui_type = "slider";
@@ -262,7 +384,8 @@ uniform int DebugOverlay <
 	ui_category = "Debug";
 > = 0;
 
-uniform float frametime < source = "frametime"; >;
+uniform float frametime  < source = "frametime"; >;
+uniform int   framecount < source = "framecount"; >;
 
 // ---------------------------------------------------------------------------
 //  Resources
@@ -278,16 +401,19 @@ storage2D<int> stHistogram { Texture = texHistogram; };
 sampler2D<int> sampHistogram { Texture = texHistogram; };
 #endif
 
-// Persisted adaptation state: x=smoothed peak nits, y=smoothed FALL nits,
-//                             z=raw FALL nits (debug), w=max bin count (overlay).
-texture texAdapt { Width = 1; Height = 1; Format = RGBA32F; };
+// Persisted adaptation state, two texels:
+//   0: x=smoothed peak nits, y=smoothed FALL nits, z=raw FALL nits (debug), w=max bin count (overlay)
+//   1: x=slow ABL energy integrator (nits), y=smoothed perceptual mean (nits), z=raw perceptual mean
+texture texAdapt { Width = 2; Height = 1; Format = RGBA32F; };
 storage2D<float4> stAdapt { Texture = texAdapt; };
 sampler samplerAdapt { Texture = texAdapt; };
 
-// Separable luminance blur (PQ-encoded) — neighbourhood mean for local contrast.
-texture texLumaH     { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F; };
+// Separable luminance blur (PQ-encoded) - neighbourhood mean for local contrast.
+// Lives at the base resolution (1/DVHDR_BASE_DOWNSCALE): the base is low
+// frequency by definition, and the tonemap samples it back up bilinearly.
+texture texLumaH     { Width = DVHDR_BASE_W; Height = DVHDR_BASE_H; Format = R16F; };
 sampler sampLumaH    { Texture = texLumaH; };
-texture texLumaBlur  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F; };
+texture texLumaBlur  { Width = DVHDR_BASE_W; Height = DVHDR_BASE_H; Format = R16F; };
 sampler sampLumaBlur { Texture = texLumaBlur; };
 
 // ---------------------------------------------------------------------------
@@ -349,6 +475,25 @@ float luminance(float3 n, int csp)
 {
 	if (csp == CSP_HDR10) return dot(max(n, 0.0), float3(0.2627, 0.6780, 0.0593)); // BT.2020
 	return dot(max(n, 0.0), float3(0.2126, 0.7152, 0.0722));                       // BT.709
+}
+
+// Hue-preserving gamut clip: a colour with a channel below zero or above the
+// ceiling is pulled straight toward its own luminance until it fits, instead
+// of having the offending channel chopped, which shifts the hue.
+float3 gamut_clip(float3 c, float ceiling, int csp)
+{
+	float3 w  = (csp == CSP_HDR10) ? float3(0.2627, 0.6780, 0.0593) : float3(0.2126, 0.7152, 0.0722);
+	float  Y  = max(dot(c, w), 0.0);
+	float  mn = min(c.r, min(c.g, c.b));
+	if (mn < 0.0)
+		c = Y + (c - Y) * (Y / max(Y - mn, 1e-6));
+	float  mx = max(c.r, max(c.g, c.b));
+	if (ceiling > 0.0 && mx > ceiling)
+	{
+		float Yc = min(Y, ceiling);
+		c = Yc + (c - Yc) * saturate((ceiling - Yc) / max(mx - Yc, 1e-6));
+	}
+	return max(c, 0.0);
 }
 
 // BT.2390-8 EETF — maps source luminance into [black, peak] with a Hermite knee.
@@ -438,7 +583,10 @@ float3 dice_recombine(float3 linNits, float Ysrc, float Yt, int csp, float chrom
 	float Isrc      = ictcp.x;
 	float pqDelta   = nits_to_pq(Yt) - nits_to_pq(max(Ysrc, 1e-4));
 	float Idst      = saturate(Isrc + pqDelta);
-	float chromaScl = lerp(1.0, Idst / max(Isrc, 1e-4), chromaCorrect);
+	// Lifted near-black would have its (mostly noise) chroma multiplied hard;
+	// fade the preservation out below ShadowDesat so it lightens to grey.
+	float shadowW   = (ShadowDesat > 0.0) ? smoothstep(0.0, nits_to_pq(ShadowDesat), nits_to_pq(Yt)) : 1.0;
+	float chromaScl = lerp(1.0, Idst / max(Isrc, 1e-4), chromaCorrect * shadowW);
 
 	ictcp.x   = Idst;
 	ictcp.yz *= chromaScl;
@@ -447,7 +595,7 @@ float3 dice_recombine(float3 linNits, float Ysrc, float Yt, int csp, float chrom
 	float3 lms2    = PQ_to_linear(saturate(lmsp2)) * 10000.0;
 	float3 out2020 = mul(LMS_to_RGB2020, lms2);
 	float3 outNits = (csp == CSP_HDR10) ? out2020 : mul(RGB2020_to_709, out2020);
-	return max(outNits, 0.0);
+	return GamutClip ? gamut_clip(outNits, DisplayPeak, csp) : max(outNits, 0.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -522,8 +670,14 @@ void CS_Analyze(uint3 id : SV_DispatchThreadID)
 
 void CS_Adapt(uint3 id : SV_DispatchThreadID)
 {
+	// Two averages come out of the histogram: the linear frame average (FALL,
+	// what the panel's ABL answers to) and the perceptual (PQ) mean (what a
+	// viewer reads as the scene's brightness). Texel 0 of the adapt state keeps
+	// the fast-smoothed peak / FALL; texel 1 keeps the slow ABL energy
+	// integrator and the smoothed perceptual mean.
 	float total   = 0.0;
 	float sumNits = 0.0;
+	float sumPq   = 0.0;
 	float maxBin  = 1.0;
 
 	[loop]
@@ -532,10 +686,12 @@ void CS_Adapt(uint3 id : SV_DispatchThreadID)
 		float cnt = float(tex2Dfetch(stHistogram, int2(i, 0)));
 		total   += cnt;
 		sumNits += cnt * bin_to_nits(i);
+		sumPq   += cnt * ((i + 0.5) / float(DVHDR_BINS));
 		maxBin   = max(maxBin, cnt);
 	}
 
-	float fall = sumNits / max(total, 1.0);
+	float fall     = sumNits / max(total, 1.0);
+	float meanNits = pq_to_nits(sumPq / max(total, 1.0));
 
 	float allow = total * (1.0 - PeakPercentile * 0.01);
 	float acc   = 0.0;
@@ -549,18 +705,44 @@ void CS_Adapt(uint3 id : SV_DispatchThreadID)
 	float peak = bin_to_nits(pidx);
 
 	float4 prev  = tex2Dfetch(stAdapt, int2(0, 0));
+	float4 prev2 = tex2Dfetch(stAdapt, int2(1, 0));
 	float  pPeak = prev.x;
 	float  pFall = prev.y;
-	if (pFall <= 0.0001) pFall = fall; // first-frame snap, no flash
-	if (pPeak <= 0.0001) pPeak = peak;
+	float  pSlow = prev2.x;
+	float  pMean = prev2.y;
+
+	// First frame: start from what is on screen, or from the declared content peak.
+	if (pFall <= 0.0001) { pFall = fall; pSlow = fall; pMean = meanNits; }
+	if (pPeak <= 0.0001) pPeak = (ContentPeak > 0.0) ? ContentPeak : DisplayPeak;
+	if (pSlow <= 0.0001) pSlow = fall;
+	if (pMean <= 0.0001) pMean = meanNits;
+
+	// A jump of the frame average beyond SceneCut (in PQ) is a cut, not a
+	// drift: the fast state snaps to the new scene instead of easing into it.
+	float jump = abs(nits_to_pq(fall) - nits_to_pq(pFall));
+	bool  cut  = (SceneCut > 0.0) && (jump > SceneCut);
+
+	// Changes within the deadband hold the previous value, so a scene hovering
+	// around the target does not breathe.
+	float band  = Deadband * 0.01;
+	float tFall = (abs(fall - pFall)     <= band * pFall) ? pFall : fall;
+	float tPeak = (abs(peak - pPeak)     <= band * pPeak) ? pPeak : peak;
+	float tMean = (abs(meanNits - pMean) <= band * pMean) ? pMean : meanNits;
 
 	float aUp = saturate(1.0 - exp(-frametime / max(AttackMs,  1.0)));
 	float aDn = saturate(1.0 - exp(-frametime / max(ReleaseMs, 1.0)));
 
-	float sFall = lerp(pFall, fall, (fall > pFall) ? aUp : aDn);
-	float sPeak = lerp(pPeak, peak, (peak > pPeak) ? aUp : aDn);
+	float sFall = cut ? fall     : lerp(pFall, tFall, (tFall > pFall) ? aUp : aDn);
+	float sPeak = cut ? peak     : lerp(pPeak, tPeak, (tPeak > pPeak) ? aUp : aDn);
+	float sMean = cut ? meanNits : lerp(pMean, tMean, (tMean > pMean) ? aUp : aDn);
+
+	// Sustained energy for ABL: a slow integrator that a cut does not reset,
+	// because the panel's power budget does not reset either.
+	float aSlow    = (AblWindow > 0.0) ? saturate(1.0 - exp(-frametime / (AblWindow * 1000.0))) : 1.0;
+	float slowFall = lerp(pSlow, fall, aSlow);
 
 	tex2Dstore(stAdapt, int2(0, 0), float4(sPeak, sFall, fall, maxBin));
+	tex2Dstore(stAdapt, int2(1, 0), float4(slowFall, sMean, meanNits, 0.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -573,22 +755,45 @@ float pq_luma_at(int2 px, int csp)
 	return nits_to_pq(luminance(decode_to_nits(c, csp), csp));
 }
 
+// The blur runs at the base resolution (1/DVHDR_BASE_DOWNSCALE): the base is
+// low frequency by definition, so a downscaled one costs a fraction and reads
+// back through the bilinear sampler with no visible loss. With BaseEdgeSigma
+// the blur is bilateral: neighbours far from the centre in PQ weigh little, so
+// the base follows edges instead of bleeding across them, and the lift stops
+// haloing around bright objects.
+
+// Full-resolution pixel at the centre of a base-resolution one.
+int2 base_to_full(int2 bp)
+{
+	return min(bp * DVHDR_BASE_DOWNSCALE + (DVHDR_BASE_DOWNSCALE / 2), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
+}
+
+float range_weight(float v, float c)
+{
+	if (BaseEdgeSigma <= 0.0) return 1.0;
+	float d = (v - c) / BaseEdgeSigma;
+	return exp(-0.5 * d * d);
+}
+
 float PS_BlurH(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
 	int  csp = get_csp();
-	int2 px  = int2(pos.xy);
+	int2 bp  = int2(pos.xy);
+	int2 fp  = base_to_full(bp);
 	if (DetailGain <= 0.0)
-		return pq_luma_at(px, csp); // feature off — pass per-pixel luma through untouched
+		return pq_luma_at(fp, csp); // feature off - pass per-pixel luma through untouched
 
-	int   R     = clamp(int(DetailRadius + 0.5), 1, DVHDR_LC_MAX_RADIUS);
+	int   R     = clamp(int(DetailRadius / float(DVHDR_BASE_DOWNSCALE) + 0.5), 1, DVHDR_LC_MAX_RADIUS);
 	float sigma = max(R * 0.5, 1.0);
+	float c     = pq_luma_at(fp, csp);
 	float sum = 0.0, wsum = 0.0;
 	[loop]
 	for (int d = -R; d <= R; d++)
 	{
-		int2  sp  = int2(clamp(px.x + d, 0, BUFFER_WIDTH - 1), px.y);
-		float wgt = exp(-0.5 * float(d * d) / (sigma * sigma));
-		sum  += pq_luma_at(sp, csp) * wgt;
+		int   x   = clamp(fp.x + d * DVHDR_BASE_DOWNSCALE, 0, BUFFER_WIDTH - 1);
+		float v   = pq_luma_at(int2(x, fp.y), csp);
+		float wgt = exp(-0.5 * float(d * d) / (sigma * sigma)) * range_weight(v, c);
+		sum  += v * wgt;
 		wsum += wgt;
 	}
 	return sum / max(wsum, 1e-5);
@@ -596,19 +801,24 @@ float PS_BlurH(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 
 float PS_BlurV(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
-	int2 px = int2(pos.xy);
+	int2 bp = int2(pos.xy);
 	if (DetailGain <= 0.0)
-		return tex2Dfetch(sampLumaH, px).r;
+		return tex2Dfetch(sampLumaH, bp).r;
 
-	int   R     = clamp(int(DetailRadius + 0.5), 1, DVHDR_LC_MAX_RADIUS);
+	int   csp   = get_csp();
+	int   R     = clamp(int(DetailRadius / float(DVHDR_BASE_DOWNSCALE) + 0.5), 1, DVHDR_LC_MAX_RADIUS);
 	float sigma = max(R * 0.5, 1.0);
+	// The range term compares against the pixel's own luma, not the
+	// horizontally blurred one, so an edge survives both passes.
+	float c     = pq_luma_at(base_to_full(bp), csp);
 	float sum = 0.0, wsum = 0.0;
 	[loop]
 	for (int d = -R; d <= R; d++)
 	{
-		int2  sp  = int2(px.x, clamp(px.y + d, 0, BUFFER_HEIGHT - 1));
-		float wgt = exp(-0.5 * float(d * d) / (sigma * sigma));
-		sum  += tex2Dfetch(sampLumaH, sp).r * wgt;
+		int   y   = clamp(bp.y + d, 0, DVHDR_BASE_H - 1);
+		float v   = tex2Dfetch(sampLumaH, int2(bp.x, y)).r;
+		float wgt = exp(-0.5 * float(d * d) / (sigma * sigma)) * range_weight(v, c);
+		sum  += v * wgt;
 		wsum += wgt;
 	}
 	return sum / max(wsum, 1e-5);
@@ -630,14 +840,27 @@ float4 PS_Tonemap(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	float3 src  = (DebandThreshold > 0.0)
 		? deband_source(uv, pos.xy, float2(1.0 / BUFFER_WIDTH, 1.0 / BUFFER_HEIGHT), csp)
 		: tex2D(samplerBackBuffer, uv).rgb;
-	float4 ad   = tex2Dfetch(samplerAdapt, int2(0, 0));
-	float adPeak = ad.x;
-	float adFall = ad.y;
+	float4 ad       = tex2Dfetch(samplerAdapt, int2(0, 0));
+	float4 ad2      = tex2Dfetch(samplerAdapt, int2(1, 0));
+	float  adPeak   = ad.x;
+	float  adFall   = ad.y;
+	float  slowFall = ad2.x;
+	float  adMean   = ad2.y;
 
 	float targetFall = DisplayMaxFALL * (HeadroomPercent * 0.01);
-	float ratio      = targetFall / max(adFall, 0.01);
-	float g = (ratio < 1.0) ? max(ratio, MinGain)
-	                        : min(pow(ratio, LiftStrength), MaxGain);
+
+	// Compression guards the panel's power budget, which follows sustained
+	// linear energy: the slow integrator drives it and the fast average only
+	// steps in above the ceiling. The lift answers to how bright the scene
+	// reads, the perceptual mean when so configured.
+	float compFall = (AblWindow > 0.0)
+		? max(slowFall, (adFall > targetFall * max(FastCeiling * 0.01, 1.0)) ? adFall : 0.0)
+		: adFall;
+	float liftRef  = (LiftMetric != 0) ? adMean : adFall;
+	float ratioC   = targetFall / max(compFall, 0.01);
+	float ratioL   = targetFall / max(liftRef, 0.01);
+	float g = (ratioC < 1.0) ? max(ratioC, MinGain)
+	                         : min(pow(max(ratioL, 1.0), LiftStrength), MaxGain);
 
 	float3 lin  = decode_to_nits(src, csp);
 	float  Ysrc = luminance(lin, csp);
@@ -726,12 +949,43 @@ float4 PS_Tonemap(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 		float3 pD = linear_to_PQ(saturate(decode_to_nits(tex2D(samplerBackBuffer, uv + float2(0.0,  ts.y)).rgb, csp) / 10000.0));
 		float3 dev = max(max(abs(pL - pC), abs(pR - pC)), max(abs(pU - pC), abs(pD - pC)));
 		float  act  = max(dev.r, max(dev.g, dev.b));         // luma OR chroma variance, in PQ
-		float  actF = lerp(DitherFloor, 1.0, saturate(act / max(DitherActivity, 1e-5)));
-		float  lsb  = (DitherStrength / 1023.0) * actF;      // one PQ code step, scaled
+		// A slow ramp is locally flat yet bands the worst, so gradation is also
+		// read across a wider span of the low-pass base.
+		float2 tw   = ts * DitherWideSpan;
+		float  bL   = tex2D(sampLumaBlur, uv - float2(tw.x, 0.0)).r;
+		float  bR   = tex2D(sampLumaBlur, uv + float2(tw.x, 0.0)).r;
+		float  bU   = tex2D(sampLumaBlur, uv - float2(0.0, tw.y)).r;
+		float  bD   = tex2D(sampLumaBlur, uv + float2(0.0, tw.y)).r;
+		float  wide = max(abs(bR - bL), abs(bD - bU));
+		float  actN = max(act / max(DitherActivity, 1e-5), wide / max(DitherWideActivity, 1e-5));
+		float  actF = lerp(DitherFloor, 1.0, saturate(actN));
 
-		float3 noise = float3(ign(pos.xy),
-		                      ign(pos.xy + float2(53.0, 17.0)),
-		                      ign(pos.xy + float2(101.0, 71.0))) - 0.5;
+		// Panels step more coarsely toward their peak: the amplitude rises with
+		// luminance from DitherHighlightFrom up to the display peak.
+		float  boost = (DitherHighlightBoost > 1.0)
+			? lerp(1.0, DitherHighlightBoost,
+			       smoothstep(nits_to_pq(max(DitherHighlightFrom, 1e-4)), nits_to_pq(max(DisplayPeak, 1.0)), nits_to_pq(Yt)))
+			: 1.0;
+		float  lsb  = (DitherStrength / 1023.0) * actF * boost;   // peak-to-peak amplitude in PQ code steps
+
+		// Temporal: a frame-varying offset walks the pattern, and alternate
+		// frames flip its sign so each pair averages to the unquantised value.
+		float2 dpos = pos.xy + (DitherTemporal ? float(framecount % 64) * 5.588238 : 0.0);
+		float3 n1   = float3(ign(dpos), ign(dpos + float2(53.0, 17.0)), ign(dpos + float2(101.0, 71.0)));
+		float3 noise;
+		if (DitherShape != 0)
+		{
+			// Triangular (TPDF): the sum of two independent uniforms. It decouples
+			// the quantisation error from the signal, so no banding-shaped noise
+			// modulation survives, which uniform noise below one step leaves behind.
+			float3 n2 = float3(ign(dpos + float2(37.0, 89.0)), ign(dpos + float2(151.0, 29.0)), ign(dpos + float2(211.0, 131.0)));
+			noise = (n1 + n2 - 1.0) * 0.5;
+		}
+		else
+		{
+			noise = n1 - 0.5;
+		}
+		if (DitherTemporal && (framecount % 2) != 0) noise = -noise;
 
 		if (csp == CSP_HDR10)
 		{

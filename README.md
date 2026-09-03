@@ -7,10 +7,11 @@ A ReShade 6.5+ effect that adds **dynamic, per-scene display-mapping on top of a
 Static HDR tonemappers (RenoDX, in-game HDR, etc.) map the picture to a **fixed** peak — they don't react to scene content, and they don't account for your panel's **MaxFALL** (the sustained full-screen brightness limit that drives OLED/QD-OLED ABL "pumping"). DVHDR adds the missing dynamic layer:
 
 - **Per-frame analysis** — a compute-shader histogram measures the scene's average light level (FALL) and a percentile peak.
-- **Temporal adaptation** — those stats are smoothed with separate attack/release rates, so scenes settle instead of flickering.
-- **FALL governor** — scales the frame to keep its average within your MaxFALL, while a **BT.2390 rolloff** lets sparse highlights still reach the panel's true peak.
+- **Temporal adaptation** — those stats are smoothed with separate attack/release rates, snap on scene cuts and ignore tiny drifts, so scenes settle instead of flickering or pumping.
+- **FALL governor** — scales the frame to keep its average within your MaxFALL, driven by a slow energy integrator so brief flashes keep their punch, while a **BT.2390 rolloff** lets sparse highlights still reach the panel's true peak.
 - **Highlight-protected shadow lift** — gently raises shadows without touching the UI or bright detail (the lift fades out above a configurable luminance knee).
-- **Dynamic contrast** — restores the local contrast a lift would otherwise flatten, scaled to how much was lifted.
+- **Dynamic contrast** — restores the local contrast a lift would otherwise flatten, scaled to how much was lifted, on an edge-aware base so nothing halos.
+- **Colour integrity** — ICtCp chroma preservation that fades out in the deepest shadows, and a hue-preserving gamut clip.
 
 ## Why it exists
 
@@ -35,6 +36,16 @@ DVHDR is **not** an HDR conversion. It expects an HDR signal already on the wire
 | **Dark-scene lift** / **Protect highlights above** | How much shadows rise, and the luminance above which the lift fades out (UI/highlights stay native). |
 | **Dynamic contrast** | Restores contrast lost to the lift, confined to the shadow region. |
 | **Attack / Release** | React fast when brightening, settle slowly when darkening. |
+| **Scene cut threshold / Deadband** | Snap the adaptation on a hard cut; ignore changes too small to matter. |
+| **ABL window / Fast ceiling** | Compression follows sustained energy over this many seconds; the fast average only intervenes above the ceiling. |
+| **Lift answers to** | Whether the shadow lift responds to the perceptual mean or the linear frame average. |
+| **Base edge sigma** | Edge-aware base for the lift: larger radii without halos. 0 = plain Gaussian. |
+| **Shadow desaturation / Gamut clip** | Keep lifted near-black noise grey; keep out-of-gamut colours on hue. |
+| **Dither shape / strength** | Triangular noise at 2 code steps peak-to-peak, the textbook dither; uniform is the old behaviour. |
+| **Wide gradation span / activity** | Read gradation across a wide span too, so slow ramps in bright skies and glows get full dither instead of the floor. |
+| **Highlight boost** | Raise the dither amplitude toward the display peak, where panels step most coarsely. |
+| **Temporal dither** | Walk the dither pattern each frame and flip its sign on alternate frames so pairs average out. |
+| `DVHDR_BASE_DOWNSCALE` (preprocessor) | Resolution divisor of the lift base; 2 by default, 1 for full resolution. |
 | **Debug overlay** | Live histogram with FALL / target / peak markers for tuning. |
 
 ## Requirements
